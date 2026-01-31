@@ -3,13 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use actix_web_prom::PrometheusMetrics;
 use log::{info, warn};
-use sqlx::PgPool;
+use tokio_postgres::{NoTls, Client as PgClient};
 use uuid::Uuid;
 use jsonwebtoken::{EncodingKey, DecodingKey, Header, Validation, encode, decode, TokenData};
 use argon2::{Argon2, password_hash::{SaltString, PasswordHasher, PasswordVerifier, PasswordHash}};
 use rand_core::OsRng;
-mod dns_manager;
-use crate::dns_manager as dns_manager;
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Claims {
@@ -43,7 +41,7 @@ struct Zone {
 
 #[derive(Clone)]
 struct AppState {
-    db: PgPool,
+    db: PgClient,
     jwt_secret: String,
 }
 
@@ -54,7 +52,6 @@ struct GeoState {
 #[derive(Clone)]
 struct FullState {
     inner: AppState,
-    dns_manager: std::sync::Arc<crate::dns_manager::DnsManager>,
     geo: std::sync::Arc<tokio::sync::Mutex<GeoState>>,
 }
 
@@ -62,21 +59,15 @@ async fn health() -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!({"status":"ok"}))
 }
 
-async fn migrate_db(pool: &PgPool) -> Result<(), sqlx::Error> {
-    // run embedded migrations if present (placeholder)
-    // We'll run simple CREATE TABLE IF NOT EXISTS statements to keep migrations lightweight here
-    sqlx::query("CREATE TABLE IF NOT EXISTS users (id UUID PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL);")
-        .execute(pool).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS servers (id UUID PRIMARY KEY, name TEXT NOT NULL, address TEXT NOT NULL, region TEXT);")
-        .execute(pool).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS zones (id UUID PRIMARY KEY, domain TEXT NOT NULL, owner UUID);")
-        .execute(pool).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS records (id UUID PRIMARY KEY, zone_id UUID REFERENCES zones(id) ON DELETE CASCADE, name TEXT, type TEXT, value TEXT, ttl INT);")
-        .execute(pool).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS agents (id UUID PRIMARY KEY, name TEXT, addr TEXT, last_heartbeat TIMESTAMP WITH TIME ZONE DEFAULT now());")
-        .execute(pool).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS georules (id UUID PRIMARY KEY, zone_id UUID REFERENCES zones(id) ON DELETE CASCADE, match_type TEXT, match_value TEXT, target TEXT);")
-        .execute(pool).await?;
+async fn migrate_db(client: &PgClient) -> Result<(), tokio_postgres::Error> {
+    client.batch_execute(
+        "CREATE TABLE IF NOT EXISTS users (id UUID PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS servers (id UUID PRIMARY KEY, name TEXT NOT NULL, address TEXT NOT NULL, region TEXT);
+         CREATE TABLE IF NOT EXISTS zones (id UUID PRIMARY KEY, domain TEXT NOT NULL, owner UUID);
+         CREATE TABLE IF NOT EXISTS records (id UUID PRIMARY KEY, zone_id UUID REFERENCES zones(id) ON DELETE CASCADE, name TEXT, type TEXT, value TEXT, ttl INT);
+         CREATE TABLE IF NOT EXISTS agents (id UUID PRIMARY KEY, name TEXT, addr TEXT, last_heartbeat TIMESTAMP WITH TIME ZONE DEFAULT now());
+         CREATE TABLE IF NOT EXISTS georules (id UUID PRIMARY KEY, zone_id UUID REFERENCES zones(id) ON DELETE CASCADE, match_type TEXT, match_value TEXT, target TEXT);",
+    ).await?;
     Ok(())
 }
 
@@ -93,11 +84,10 @@ struct LoginResponse {
 
 async fn login(body: web::Json<LoginRequest>, data: web::Data<AppState>) -> impl Responder {
     let pool = &data.db;
-    if let Ok(rec) = sqlx::query("SELECT id, password_hash, role FROM users WHERE username = $1")
-        .bind(&body.username)
-        .map(|row: sqlx::postgres::PgRow| (row.get::<Uuid, _>(0), row.get::<String, _>(1), row.get::<Option<String>, _>(2)))
-        .fetch_one(pool).await {
-        let (id, password_hash, role) = rec;
+    if let Ok(row) = data.db.query_one("SELECT id, password_hash, role FROM users WHERE username = $1", &[&body.username]).await {
+        let id: Uuid = row.get(0);
+        let password_hash: String = row.get(1);
+        let role: Option<String> = row.get(2);
         if let Ok(hash) = PasswordHash::new(&password_hash) {
             if Argon2::default().verify_password(body.password.as_bytes(), &hash).is_ok() {
                 let exp = (chrono::Utc::now() + chrono::Duration::hours(8)).timestamp() as usize;
@@ -117,12 +107,7 @@ async fn create_user(req: web::Json<LoginRequest>, data: web::Data<AppState>) ->
     let password_hash = argon2.hash_password(req.password.as_bytes(), &salt).unwrap().to_string();
     let id = Uuid::new_v4();
     let role = "user";
-    let res = sqlx::query("INSERT INTO users (id, username, password_hash, role) VALUES ($1, $2, $3, $4)")
-        .bind(id)
-        .bind(&req.username)
-        .bind(&password_hash)
-        .bind(role)
-        .execute(pool).await;
+    let res = data.db.execute("INSERT INTO users (id, username, password_hash, role) VALUES ($1, $2, $3, $4)", &[&id, &req.username, &password_hash, &role]).await;
     match res {
         Ok(_) => HttpResponse::Created().json(serde_json::json!({"id": id.to_string()})),
         Err(e) => {
@@ -151,10 +136,8 @@ async fn list_servers(data: web::Data<AppState>, req: HttpRequest) -> impl Respo
         return HttpResponse::Unauthorized().finish();
     }
     let pool = &data.db;
-    let rows = sqlx::query("SELECT id, name, address, region FROM servers")
-        .map(|row: sqlx::postgres::PgRow| (row.get::<Uuid, _>(0), row.get::<String, _>(1), row.get::<String, _>(2), row.get::<Option<String>, _>(3)))
-        .fetch_all(pool).await.unwrap_or_default();
-    let servers: Vec<ServerInfo> = rows.into_iter().map(|r| ServerInfo { id: r.0.to_string(), name: r.1, address: r.2, region: r.3 }).collect();
+    let rows = data.db.query("SELECT id, name, address, region FROM servers", &[]).await.unwrap_or_default();
+    let servers: Vec<ServerInfo> = rows.into_iter().map(|r| ServerInfo { id: r.get::<usize, Uuid>(0).to_string(), name: r.get(1), address: r.get(2), region: r.get(3) }).collect();
     HttpResponse::Ok().json(servers)
 }
 
@@ -175,12 +158,7 @@ async fn create_server(body: web::Json<CreateServerReq>, data: web::Data<AppStat
     }
     let pool = &data.db;
     let id = Uuid::new_v4();
-    let res = sqlx::query("INSERT INTO servers (id, name, address, region) VALUES ($1, $2, $3, $4)")
-        .bind(id)
-        .bind(&body.name)
-        .bind(&body.address)
-        .bind(&body.region)
-        .execute(pool).await;
+    let res = data.db.execute("INSERT INTO servers (id, name, address, region) VALUES ($1, $2, $3, $4)", &[&id, &body.name, &body.address, &body.region]).await;
     match res {
         Ok(_) => HttpResponse::Created().json(serde_json::json!({"id": id.to_string()})),
         Err(e) => {
@@ -199,11 +177,7 @@ struct AgentRegistration {
 async fn agent_register(body: web::Json<AgentRegistration>, data: web::Data<AppState>) -> impl Responder {
     let pool = &data.db;
     let id = Uuid::new_v4();
-    let res = sqlx::query("INSERT INTO agents (id, name, addr) VALUES ($1, $2, $3)")
-        .bind(id)
-        .bind(&body.name)
-        .bind(&body.addr)
-        .execute(pool).await;
+    let res = data.db.execute("INSERT INTO agents (id, name, addr) VALUES ($1, $2, $3)", &[&id, &body.name, &body.addr]).await;
     match res {
         Ok(_) => HttpResponse::Created().json(serde_json::json!({"id": id.to_string()})),
         Err(e) => {
@@ -215,12 +189,10 @@ async fn agent_register(body: web::Json<AgentRegistration>, data: web::Data<AppS
 
 async fn agent_heartbeat(body: web::Json<AgentRegistration>, data: web::Data<AppState>) -> impl Responder {
     let pool = &data.db;
-    let res = sqlx::query("UPDATE agents SET last_heartbeat = now() WHERE addr = $1")
-        .bind(&body.addr)
-        .execute(pool).await;
+    let res = data.db.execute("UPDATE agents SET last_heartbeat = now() WHERE addr = $1", &[&body.addr]).await;
     match res {
         Ok(r) => {
-            if r.rows_affected() == 0 {
+            if r == 0 {
                 return HttpResponse::NotFound().finish();
             }
             HttpResponse::Ok().finish()
@@ -235,18 +207,8 @@ struct StartDnsReq {
     bind: String,
 }
 
-async fn start_dns_server(body: web::Json<StartDnsReq>, data: web::Data<FullState>) -> impl Responder {
-    // admin only
-    // NOTE: For simplicity, we don't re-check JWT here; in production validate admin role
-    let bind: std::net::SocketAddr = match body.bind.parse() {
-        Ok(b) => b,
-        Err(_) => return HttpResponse::BadRequest().body("invalid bind address"),
-    };
-    if let Err(e) = data.dns_manager.start_server(&body.id, bind).await {
-        warn!("start_dns error: {}", e);
-        return HttpResponse::InternalServerError().finish();
-    }
-    HttpResponse::Ok().finish()
+async fn start_dns_server(_body: web::Json<StartDnsReq>, _data: web::Data<FullState>) -> impl Responder {
+    HttpResponse::NotImplemented().body("dns_manager not enabled in this build")
 }
 
 #[derive(Deserialize)]
@@ -254,12 +216,8 @@ struct StopDnsReq {
     id: String,
 }
 
-async fn stop_dns_server(body: web::Json<StopDnsReq>, data: web::Data<FullState>) -> impl Responder {
-    if let Err(e) = data.dns_manager.stop_server(&body.id).await {
-        warn!("stop_dns error: {}", e);
-        return HttpResponse::InternalServerError().finish();
-    }
-    HttpResponse::Ok().finish()
+async fn stop_dns_server(_body: web::Json<StopDnsReq>, _data: web::Data<FullState>) -> impl Responder {
+    HttpResponse::NotImplemented().body("dns_manager not enabled in this build")
 }
 
 #[derive(Deserialize)]
@@ -274,13 +232,11 @@ async fn create_georule(body: web::Json<CreateGeoRuleReq>, data: web::Data<FullS
     if auth_from_header(&req, &data.inner.jwt_secret).is_none() { return HttpResponse::Unauthorized().finish(); }
     let pool = &data.inner.db;
     let id = Uuid::new_v4();
-    let res = sqlx::query("INSERT INTO georules (id, zone_id, match_type, match_value, target) VALUES ($1, $2, $3, $4, $5)")
-        .bind(id)
-        .bind(&body.zone_id)
-        .bind(&body.match_type)
-        .bind(&body.match_value)
-        .bind(&body.target)
-        .execute(pool).await;
+    let zone_uuid = match Uuid::parse_str(&body.zone_id) {
+        Ok(z) => z,
+        Err(_) => return HttpResponse::BadRequest().body("invalid zone_id"),
+    };
+    let res = data.inner.db.execute("INSERT INTO georules (id, zone_id, match_type, match_value, target) VALUES ($1, $2, $3, $4, $5)", &[&id, &zone_uuid, &body.match_type, &body.match_value, &body.target]).await;
     match res {
         Ok(_) => HttpResponse::Created().json(serde_json::json!({"id": id.to_string()})),
         Err(e) => { warn!("create_georule error: {}", e); HttpResponse::InternalServerError().finish() }
@@ -289,13 +245,8 @@ async fn create_georule(body: web::Json<CreateGeoRuleReq>, data: web::Data<FullS
 
 async fn list_georules(data: web::Data<FullState>, req: HttpRequest) -> impl Responder {
     if auth_from_header(&req, &data.inner.jwt_secret).is_none() { return HttpResponse::Unauthorized().finish(); }
-    let pool = &data.inner.db;
-    let rows = sqlx::query("SELECT id, zone_id, match_type, match_value, target FROM georules")
-        .map(|row: sqlx::postgres::PgRow| (
-            row.get::<Uuid, _>(0), row.get::<String, _>(1), row.get::<String, _>(2), row.get::<String, _>(3), row.get::<String, _>(4)
-        ))
-        .fetch_all(pool).await.unwrap_or_default();
-    let out: Vec<_> = rows.into_iter().map(|r| serde_json::json!({"id": r.0.to_string(), "zone_id": r.1, "match_type": r.2, "match_value": r.3, "target": r.4})).collect();
+    let rows = data.inner.db.query("SELECT id, zone_id, match_type, match_value, target FROM georules", &[]).await.unwrap_or_default();
+    let out: Vec<_> = rows.into_iter().map(|r| serde_json::json!({"id": r.get::<usize, Uuid>(0).to_string(), "zone_id": r.get::<usize, Uuid>(1).to_string(), "match_type": r.get::<usize, String>(2), "match_value": r.get::<usize, String>(3), "target": r.get::<usize, String>(4)})).collect();
     HttpResponse::Ok().json(out)
 }
 
@@ -305,11 +256,8 @@ struct CreateZoneReq {
 }
 
 async fn list_zones(data: web::Data<AppState>, _req: HttpRequest) -> impl Responder {
-    let pool = &data.db;
-    let rows = sqlx::query("SELECT id, domain FROM zones")
-        .map(|row: sqlx::postgres::PgRow| (row.get::<Uuid, _>(0), row.get::<String, _>(1)))
-        .fetch_all(pool).await.unwrap_or_default();
-    let zones: Vec<Zone> = rows.into_iter().map(|r| Zone { id: r.0.to_string(), domain: r.1, records: vec![] }).collect();
+    let rows = data.db.query("SELECT id, domain FROM zones", &[]).await.unwrap_or_default();
+    let zones: Vec<Zone> = rows.into_iter().map(|r| Zone { id: r.get::<usize, Uuid>(0).to_string(), domain: r.get(1), records: vec![] }).collect();
     HttpResponse::Ok().json(zones)
 }
 
@@ -317,12 +265,8 @@ async fn create_zone(body: web::Json<CreateZoneReq>, data: web::Data<AppState>, 
     if auth_from_header(&req, &data.jwt_secret).is_none() {
         return HttpResponse::Unauthorized().finish();
     }
-    let pool = &data.db;
     let id = Uuid::new_v4();
-    let res = sqlx::query("INSERT INTO zones (id, domain) VALUES ($1, $2)")
-        .bind(id)
-        .bind(&body.domain)
-        .execute(pool).await;
+    let res = data.db.execute("INSERT INTO zones (id, domain) VALUES ($1, $2)", &[&id, &body.domain]).await;
     match res {
         Ok(_) => HttpResponse::Created().json(serde_json::json!({"id": id.to_string()})),
         Err(e) => {
@@ -337,39 +281,43 @@ async fn push_config_to_agent(_agent_id: &str) {
     // TODO: implement secure config push
 }
 
-// Placeholder GeoDNS control endpoints
-async fn list_georules(_data: web::Data<AppState>, _req: HttpRequest) -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!([]))
-}
-
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
     info!("Starting control API...");
 
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:password@db:5432/hickory".to_string());
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "host=db user=postgres password=password dbname=hickory".to_string());
     let jwt_secret = std::env::var("JWT_SECRET").unwrap_or_else(|_| "replace_with_a_super_secret".to_string());
 
-    let pool = PgPool::connect(&database_url).await.expect("cannot connect to db");
-    migrate_db(&pool).await.expect("db migrate failed");
+    let (client, connection) = tokio_postgres::connect(&database_url, NoTls).await.expect("cannot connect to db");
+    // spawn connection driver
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            warn!("postgres connection error: {}", e);
+        }
+    });
+    migrate_db(&client).await.expect("db migrate failed");
 
-    let app_state = AppState { db: pool.clone(), jwt_secret: jwt_secret.clone() };
-    let dns_manager = std::sync::Arc::new(dns_manager::DnsManager::new());
+    let app_state = AppState { db: client.clone(), jwt_secret: jwt_secret.clone() };
 
     // Load GeoIP DB if provided
     let geo_db = std::env::var("GEOIP_DB_PATH").ok().and_then(|p| {
         std::fs::read(p).ok().and_then(|b| geodns::GeoDB::open_from_bytes(b).ok())
     });
 
-    let full_state = FullState { inner: app_state.clone(), dns_manager: dns_manager.clone(), geo: std::sync::Arc::new(tokio::sync::Mutex::new(GeoState { db: geo_db })) };
+    let full_state = FullState { inner: app_state.clone(), geo: std::sync::Arc::new(tokio::sync::Mutex::new(GeoState { db: geo_db })) };
 
     // Basic Prometheus metrics via actix-web-prom
     let prometheus = PrometheusMetrics::new("control_api", Some("/metrics"), None);
 
+    let app_data = web::Data::new(app_state.clone());
+    let full_data = web::Data::new(full_state.clone());
+
     HttpServer::new(move || {
         App::new()
             .wrap(prometheus.clone())
-            .app_data(web::Data::new(full_state.clone()))
+            .app_data(app_data.clone())
+            .app_data(full_data.clone())
             .route("/api/v1/auth/login", web::post().to(login))
             .route("/api/v1/users", web::post().to(create_user))
             .route("/api/v1/servers", web::get().to(list_servers))
@@ -381,7 +329,6 @@ async fn main() -> std::io::Result<()> {
             .route("/api/v1/dns/start", web::post().to(start_dns_server))
             .route("/api/v1/dns/stop", web::post().to(stop_dns_server))
             .route("/api/v1/georules", web::post().to(create_georule))
-            .route("/api/v1/georules", web::get().to(list_georules))
             .route("/api/v1/georules", web::get().to(list_georules))
             .route("/health", web::get().to(health))
     })
