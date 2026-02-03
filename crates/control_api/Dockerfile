@@ -1,4 +1,4 @@
-FROM rust:1.71-slim-bullseye AS builder
+FROM rust:1-slim-bookworm AS builder
 WORKDIR /usr/src/control_api
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
