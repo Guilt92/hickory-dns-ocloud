@@ -1,26 +1,32 @@
 use actix_web::{web, App, HttpResponse, HttpServer, Responder, HttpRequest, http::header};
-use actix_cors::Cors;
-use serde::{Deserialize, Serialize};
-use log::{info, warn};
-use tokio_postgres::{NoTls, Client as PgClient};
-use actix_web_prom::PrometheusMetricsBuilder;
-use prometheus::{TextEncoder, Encoder, gather};
-use uuid::Uuid;
-use std::collections::HashMap;
-use std::process::Command;
-use jsonwebtoken::{EncodingKey, DecodingKey, Header, Validation, encode, decode, TokenData};
-use argon2::{Argon2, password_hash::{SaltString, PasswordHasher, PasswordVerifier, PasswordHash}};
-use rand_core::OsRng;
-use chrono::TimeZone;
 
-#[derive(Clone, Serialize, Deserialize)]
+// ============================================================================
+// OpenAPI / Swagger Types
+// ============================================================================
+
+#[derive(ToSchema, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApiResponse<T> {
+    success: bool,
+    data: Option<T>,
+    error: Option<String>,
+}
+
+#[derive(ToSchema, Serialize, Deserialize)]
+struct ErrorResponse {
+    error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<String>,
+}
+
+#[derive(ToSchema, Serialize, Deserialize)]
 struct Claims {
     sub: String,
     role: String,
     exp: usize,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(ToSchema, Clone, Serialize, Deserialize)]
 struct ServerInfo {
     id: String,
     name: String,
@@ -28,7 +34,7 @@ struct ServerInfo {
     region: Option<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(ToSchema, Clone, Serialize, Deserialize)]
 struct ZoneRecord {
     name: String,
     record_type: String,
@@ -36,16 +42,28 @@ struct ZoneRecord {
     ttl: u32,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(ToSchema, Clone, Serialize, Deserialize)]
 struct Zone {
     id: String,
     domain: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     records: Vec<ZoneRecord>,
+}
+
+#[derive(ToSchema, Clone, Serialize, Deserialize)]
+struct ZoneWithOwner {
+    id: String,
+    domain: String,
+    owner: String,
+    zone_type: String,
+    created_at: String,
 }
 
 #[derive(Clone)]
 struct AppState {
-    db: std::sync::Arc<PgClient>,
+    db: Arc<PgClient>,
     jwt_secret: String,
 }
 
@@ -56,25 +74,146 @@ struct GeoState {
 #[derive(Clone)]
 struct FullState {
     inner: AppState,
-    geo: std::sync::Arc<tokio::sync::Mutex<GeoState>>,
-    processes: std::sync::Arc<tokio::sync::Mutex<HashMap<String, std::process::Child>>>,
+    geo: Arc<tokio::sync::Mutex<GeoState>>,
+    processes: Arc<tokio::sync::Mutex<HashMap<String, std::process::Child>>>,
 }
 
 async fn health() -> impl Responder {
     HttpResponse::Ok().json(serde_json::json!({"status":"ok"}))
 }
 
+async fn ready(data: web::Data<AppState>) -> impl Responder {
+    match data.db.query("SELECT 1", &[]).await {
+        Ok(_) => HttpResponse::Ok().json(serde_json::json!({"status":"ready"})),
+        Err(e) => {
+            warn!("database not ready: {}", e);
+            HttpResponse::ServiceUnavailable().json(serde_json::json!({"status":"not ready"}))
+        }
+    }
+}
+
+fn validate_domain(domain: &str) -> Result<(), String> {
+    if domain.is_empty() || domain.len() > 253 {
+        return Err("Domain must be 1-253 characters".to_string());
+    }
+    if !domain.ends_with('.') {
+        return Err("Domain must end with .".to_string());
+    }
+    let valid = domain.chars().all(|c| c.is_alphanumeric() || c == '.' || c == '-');
+    if !valid {
+        return Err("Domain contains invalid characters".to_string());
+    }
+    Ok(())
+}
+
+fn validate_record_type(record_type: &str) -> Result<(), String> {
+    let valid_types = ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SOA", "SRV", "CAA", "DS", "DNSKEY"];
+    if !valid_types.contains(&record_type.to_uppercase().as_str()) {
+        return Err(format!("Invalid record type: {}", record_type));
+    }
+    Ok(())
+}
+
 async fn migrate_db(client: &PgClient) -> Result<(), tokio_postgres::Error> {
     client.batch_execute(
-        "CREATE TABLE IF NOT EXISTS users (id UUID PRIMARY KEY, username TEXT UNIQUE NOT NULL, password_hash TEXT NOT NULL, role TEXT NOT NULL);
-         CREATE TABLE IF NOT EXISTS servers (id UUID PRIMARY KEY, name TEXT NOT NULL, address TEXT NOT NULL, region TEXT);
-         CREATE TABLE IF NOT EXISTS zones (id UUID PRIMARY KEY, domain TEXT NOT NULL, owner UUID);
-         CREATE TABLE IF NOT EXISTS records (id UUID PRIMARY KEY, zone_id UUID REFERENCES zones(id) ON DELETE CASCADE, name TEXT, type TEXT, value TEXT, ttl INT);
-         CREATE TABLE IF NOT EXISTS agents (id UUID PRIMARY KEY, name TEXT, addr TEXT, last_heartbeat TIMESTAMP WITH TIME ZONE DEFAULT now(), token_hash TEXT);
-         CREATE TABLE IF NOT EXISTS georules (id UUID PRIMARY KEY, zone_id UUID REFERENCES zones(id) ON DELETE CASCADE, match_type TEXT, match_value TEXT, target TEXT);",
+        "CREATE TABLE IF NOT EXISTS users (
+            id UUID PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            created_at TIMESTAMPTZ DEFAULT now(),
+            updated_at TIMESTAMPTZ DEFAULT now()
+        );
+        
+        CREATE TABLE IF NOT EXISTS servers (
+            id UUID PRIMARY KEY,
+            name TEXT NOT NULL,
+            address TEXT NOT NULL,
+            region TEXT,
+            created_at TIMESTAMPTZ DEFAULT now(),
+            updated_at TIMESTAMPTZ DEFAULT now()
+        );
+        
+        CREATE TABLE IF NOT EXISTS zones (
+            id UUID PRIMARY KEY,
+            domain TEXT NOT NULL,
+            owner UUID REFERENCES users(id) ON DELETE SET NULL,
+            zone_type TEXT NOT NULL DEFAULT 'primary',
+            created_at TIMESTAMPTZ DEFAULT now(),
+            updated_at TIMESTAMPTZ DEFAULT now(),
+            UNIQUE(domain)
+        );
+        
+        CREATE TABLE IF NOT EXISTS records (
+            id UUID PRIMARY KEY,
+            zone_id UUID REFERENCES zones(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            type TEXT NOT NULL,
+            value TEXT NOT NULL,
+            ttl INT NOT NULL DEFAULT 3600,
+            priority INT DEFAULT 0,
+            created_at TIMESTAMPTZ DEFAULT now(),
+            updated_at TIMESTAMPTZ DEFAULT now()
+        );
+        
+        CREATE TABLE IF NOT EXISTS agents (
+            id UUID PRIMARY KEY,
+            name TEXT NOT NULL,
+            addr TEXT NOT NULL,
+            last_heartbeat TIMESTAMPTZ DEFAULT now(),
+            token_hash TEXT NOT NULL,
+            enabled BOOLEAN DEFAULT true,
+            created_at TIMESTAMPTZ DEFAULT now(),
+            updated_at TIMESTAMPTZ DEFAULT now()
+        );
+        
+        CREATE TABLE IF NOT EXISTS georules (
+            id UUID PRIMARY KEY,
+            zone_id UUID REFERENCES zones(id) ON DELETE CASCADE,
+            match_type TEXT NOT NULL,
+            match_value TEXT NOT NULL,
+            target TEXT NOT NULL,
+            priority INT DEFAULT 0,
+            enabled BOOLEAN DEFAULT true,
+            created_at TIMESTAMPTZ DEFAULT now(),
+            updated_at TIMESTAMPTZ DEFAULT now()
+        );
+        
+        CREATE TABLE IF NOT EXISTS audit_logs (
+            id UUID PRIMARY KEY,
+            user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+            action TEXT NOT NULL,
+            resource_type TEXT NOT NULL,
+            resource_id TEXT,
+            details JSONB,
+            ip_address TEXT,
+            user_agent TEXT,
+            created_at TIMESTAMPTZ DEFAULT now()
+        );
+        
+        CREATE TABLE IF NOT EXISTS agent_configs (
+            id UUID PRIMARY KEY,
+            agent_id UUID REFERENCES agents(id) ON DELETE CASCADE,
+            config_version INT NOT NULL,
+            config_data JSONB NOT NULL,
+            release_channel TEXT NOT NULL DEFAULT 'stable',
+            is_active BOOLEAN DEFAULT false,
+            created_at TIMESTAMPTZ DEFAULT now(),
+            deployed_at TIMESTAMPTZ
+        );
+        
+        CREATE INDEX IF NOT EXISTS idx_zones_owner ON zones(owner);
+        CREATE INDEX IF NOT EXISTS idx_zones_domain ON zones(domain);
+        CREATE INDEX IF NOT EXISTS idx_records_zone_id ON records(zone_id);
+        CREATE INDEX IF NOT EXISTS idx_records_name_type ON records(name, type);
+        CREATE INDEX IF NOT EXISTS idx_georules_zone_id ON georules(zone_id);
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id);
+        CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
+        CREATE INDEX IF NOT EXISTS idx_agents_enabled ON agents(enabled);",
     ).await?;
-    // Backfill: ensure token_hash column exists for older DBs
+    
     client.batch_execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS token_hash TEXT;").await.ok();
+    client.batch_execute("ALTER TABLE agents ADD COLUMN IF NOT EXISTS enabled BOOLEAN DEFAULT true;").await.ok();
     Ok(())
 }
 
@@ -87,41 +226,87 @@ struct LoginRequest {
 #[derive(Serialize)]
 struct LoginResponse {
     token: String,
+    expires_in: usize,
 }
 
 async fn login(body: web::Json<LoginRequest>, data: web::Data<AppState>) -> impl Responder {
-    if let Ok(row) = (&*data.db).query_one("SELECT id::text, password_hash, role FROM users WHERE username = $1", &[&body.username]).await {
+    let username = body.username.trim();
+    if username.is_empty() {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "username required"}));
+    }
+    
+    if let Ok(row) = (&*data.db).query_one(
+        "SELECT id::text, password_hash, role FROM users WHERE username = $1",
+        &[&username]
+    ).await {
         let id_str: String = row.get(0);
         let id = id_str.clone();
         let password_hash: String = row.get(1);
         let role: Option<String> = row.get(2);
+        
         if let Ok(hash) = PasswordHash::new(&password_hash) {
             if Argon2::default().verify_password(body.password.as_bytes(), &hash).is_ok() {
                 let exp = (chrono::Utc::now() + chrono::Duration::hours(8)).timestamp() as usize;
-                let claims = Claims { sub: id.to_string(), role: role.clone().unwrap_or("user".to_string()), exp };
-                let token = encode(&Header::default(), &claims, &EncodingKey::from_secret(data.jwt_secret.as_bytes())).unwrap();
-                return HttpResponse::Ok().json(LoginResponse { token });
+                let claims = Claims { 
+                    sub: id.to_string(), 
+                    role: role.clone().unwrap_or_else(|| "user".to_string()), 
+                    exp 
+                };
+                
+                match encode(&Header::default(), &claims, &EncodingKey::from_secret(data.jwt_secret.as_bytes())) {
+                    Ok(token) => {
+                        return HttpResponse::Ok().json(LoginResponse { token, expires_in: 28800 });
+                    }
+                    Err(e) => {
+                        warn!("JWT encode error: {}", e);
+                        return HttpResponse::InternalServerError().finish();
+                    }
+                }
             }
         }
     }
-    HttpResponse::Unauthorized().finish()
+    HttpResponse::Unauthorized().json(serde_json::json!({"error": "invalid credentials"}))
 }
 
 async fn create_user(req: web::Json<LoginRequest>, data: web::Data<AppState>) -> impl Responder {
+    let username = req.username.trim();
+    if username.is_empty() || username.len() < 3 {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "username must be at least 3 characters"}));
+    }
+    if req.password.len() < 8 {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": "password must be at least 8 characters"}));
+    }
+    
     let mut rng = OsRng;
     let salt = SaltString::generate(&mut rng);
     let argon2 = Argon2::default();
-    let password_hash = argon2.hash_password(req.password.as_bytes(), &salt).unwrap().to_string();
-    let id = Uuid::new_v4();
-    let role = "user";
-    // pass a UUID directly to avoid parameter serialization errors
-    let id_str = id.to_string();
-    let res = (&*data.db).execute("INSERT INTO users (id, username, password_hash, role) VALUES ($1, $2, $3, $4)", &[&id_str, &req.username, &password_hash, &role]).await;
-    match res {
-        Ok(_) => HttpResponse::Created().json(serde_json::json!({"id": id.to_string()})),
+    let password_hash = match argon2.hash_password(req.password.as_bytes(), &salt) {
+        Ok(h) => h.to_string(),
         Err(e) => {
-            warn!("create_user error: {}", e);
-            HttpResponse::InternalServerError().finish()
+            warn!("password hash error: {}", e);
+            return HttpResponse::InternalServerError().json(serde_json::json!({"error": "failed to hash password"}));
+        }
+    };
+    let id = Uuid::new_v4();
+    let id_str = id.to_string();
+    let role = "user";
+    
+    match (&*data.db).execute(
+        "INSERT INTO users (id, username, password_hash, role) VALUES ($1, $2, $3, $4)",
+        &[&id_str, &username, &password_hash, &role]
+    ).await {
+        Ok(_) => {
+            info!("Created user: {}", username);
+            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "username": username}))
+        }
+        Err(e) => {
+            if e.to_string().contains("unique") || e.to_string().contains("duplicate") {
+                warn!("create_user error: username already exists");
+                HttpResponse::Conflict().json(serde_json::json!({"error": "username already exists"}))
+            } else {
+                warn!("create_user error: {}", e);
+                HttpResponse::InternalServerError().json(serde_json::json!({"error": "failed to create user"}))
+            }
         }
     }
 }
@@ -441,46 +626,75 @@ struct CreateZoneReq {
     domain: String,
 }
 
-async fn list_zones(data: web::Data<AppState>, _req: HttpRequest) -> impl Responder {
-    // show all zones if admin, otherwise only user-owned zones
-    let mut q = "SELECT id::text, domain, owner::text FROM zones".to_string();
-    let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = vec![];
-    let req = _req;
-    if let Some(tok) = auth_from_header(&req, &data.jwt_secret) {
-        if tok.claims.role != "admin" {
-            q = "SELECT id::text, domain, owner::text FROM zones WHERE owner::text = $1".to_string();
-            let owner_str = tok.claims.sub.clone();
-            params.push(&owner_str);
-            let rows = (&*data.db).query(q.as_str(), params.as_slice()).await.unwrap_or_default();
-            let zones: Vec<Zone> = rows.into_iter().map(|r| Zone { id: r.get::<usize, String>(0), domain: r.get(1), records: vec![] }).collect();
-            return HttpResponse::Ok().json(zones);
-        }
-    } else {
-        return HttpResponse::Unauthorized().finish();
+async fn list_zones(data: web::Data<AppState>, req: HttpRequest) -> impl Responder {
+    let auth = auth_from_header(&req, &data.jwt_secret);
+    if auth.is_none() {
+        return HttpResponse::Unauthorized().json(ErrorResponse { error: "unauthorized".to_string(), details: None });
     }
-    let rows = (&*data.db).query(q.as_str(), &[]).await.unwrap_or_default();
-    let zones: Vec<Zone> = rows.into_iter().map(|r| Zone { id: r.get::<usize, String>(0), domain: r.get(1), records: vec![] }).collect();
-    HttpResponse::Ok().json(zones)
+    let tok = auth.unwrap();
+    
+    let rows = if tok.claims.role == "admin" {
+        (&*data.db).query(
+            "SELECT id::text, domain, COALESCE(owner::text, '') as owner, zone_type, created_at::text FROM zones ORDER BY domain",
+            &[]
+        ).await.unwrap_or_default()
+    } else {
+        let owner_str = tok.claims.sub.clone();
+        (&*data.db).query(
+            "SELECT id::text, domain, COALESCE(owner::text, '') as owner, zone_type, created_at::text FROM zones WHERE owner::text = $1 ORDER BY domain",
+            &[&owner_str]
+        ).await.unwrap_or_default()
+    };
+    
+    let zones: Vec<ZoneWithOwner> = rows.into_iter().map(|r| ZoneWithOwner {
+        id: r.get(0),
+        domain: r.get(1),
+        owner: r.get(2),
+        zone_type: r.get(3),
+        created_at: r.get(4),
+    }).collect();
+    
+    HttpResponse::Ok().json(APIResponse { success: true, data: Some(zones), error: None })
 }
 
 async fn create_zone(body: web::Json<CreateZoneReq>, data: web::Data<AppState>, req: HttpRequest) -> impl Responder {
-    if auth_from_header(&req, &data.jwt_secret).is_none() {
-        return HttpResponse::Unauthorized().finish();
+    let auth = auth_from_header(&req, &data.jwt_secret);
+    if auth.is_none() {
+        return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"}));
     }
-    let tok = auth_from_header(&req, &data.jwt_secret).unwrap();
+    let tok = auth.unwrap();
+    
+    // Validate domain
+    if let Err(e) = validate_domain(&body.domain) {
+        return HttpResponse::BadRequest().json(serde_json::json!({"error": e}));
+    }
+    
     let owner = tok.claims.sub.clone();
     let id = Uuid::new_v4();
     let id_str = id.to_string();
-    let safe_domain = body.domain.replace("'", "''");
-    let safe_owner = owner.replace("'", "''");
-    let insert_sql = format!("INSERT INTO zones (id, domain, owner) VALUES ('{}', '{}', '{}')", id_str, safe_domain, safe_owner);
-    info!("create_zone (formatted SQL): {}", insert_sql);
-    let res = (&*data.db).execute(insert_sql.as_str(), &[]).await;
-    match res {
-        Ok(_) => HttpResponse::Created().json(serde_json::json!({"id": id.to_string()})),
+    let owner_str = owner.clone();
+    
+    match (&*data.db).execute(
+        "INSERT INTO zones (id, domain, owner) VALUES ($1, $2, $3)",
+        &[&id_str, &body.domain, &owner_str]
+    ).await {
+        Ok(_) => {
+            info!("Created zone: {} for owner: {}", body.domain, owner);
+            // Log to audit
+            let _ = (&*data.db).execute(
+                "INSERT INTO audit_logs (id, user_id, action, resource_type, resource_id, details) VALUES ($1, $2, $3, $4, $5, $6)",
+                &[&Uuid::new_v4().to_string(), &owner, &"create", &"zone", &id_str, &serde_json::json!({"domain": &body.domain})]
+            ).await;
+            HttpResponse::Created().json(serde_json::json!({"id": id.to_string(), "domain": &body.domain}))
+        }
         Err(e) => {
-            warn!("create_zone error: {}", e);
-            HttpResponse::InternalServerError().finish()
+            if e.to_string().contains("unique") || e.to_string().contains("duplicate") {
+                warn!("create_zone error: domain already exists");
+                HttpResponse::Conflict().json(serde_json::json!({"error": "domain already exists"}))
+            } else {
+                warn!("create_zone error: {}", e);
+                HttpResponse::InternalServerError().json(serde_json::json!({"error": "failed to create zone"}))
+            }
         }
     }
 }
@@ -628,25 +842,55 @@ async fn push_config_to_agents(
         data: web::Data<AppState>,
         req: HttpRequest,
     ) -> impl Responder {
-        if auth_from_header(&req, &data.jwt_secret).is_none() {
-            return HttpResponse::Unauthorized().finish();
+        let auth = auth_from_header(&req, &data.jwt_secret);
+        if auth.is_none() {
+            return HttpResponse::Unauthorized().json(serde_json::json!({"error": "unauthorized"}));
+        }
+        let tok = auth.unwrap();
+        
+        // Validate inputs
+        if body.name.is_empty() {
+            return HttpResponse::BadRequest().json(serde_json::json!({"error": "record name is required"}));
+        }
+        if let Err(e) = validate_record_type(&body.record_type) {
+            return HttpResponse::BadRequest().json(serde_json::json!({"error": e}));
+        }
+        if body.value.is_empty() {
+            return HttpResponse::BadRequest().json(serde_json::json!({"error": "record value is required"}));
+        }
+        
+        // Check zone ownership
+        let zone_id_str = zone_id.to_string();
+        let owner_check = (&*data.db).query_opt(
+            "SELECT owner FROM zones WHERE id::text = $1",
+            &[&zone_id_str]
+        ).await;
+        
+        let zone_owner: Option<String> = match owner_check {
+            Ok(Some(row)) => row.get(0),
+            _ => None
+        };
+        
+        // Allow if user is admin or zone owner
+        if tok.claims.role != "admin" && zone_owner.as_ref() != Some(&tok.claims.sub) {
+            return HttpResponse::Forbidden().json(serde_json::json!({"error": "access denied"}));
         }
     
         let id = Uuid::new_v4();
         let id_str = id.to_string();
-        let zone_id_str = zone_id.into_inner();
+        let ttl: i32 = body.ttl as i32;
     
-        let safe_name = body.name.replace("'", "''");
-        let safe_value = body.value.replace("'", "''");
-        let insert_sql = format!("INSERT INTO records (id, zone_id, name, type, value, ttl) VALUES ('{}', '{}', '{}', '{}', '{}', {})", id_str, zone_id_str, safe_name, body.record_type, safe_value, body.ttl);
-        info!("create_record (formatted SQL): {}", insert_sql);
-        let res = (&*data.db).execute(insert_sql.as_str(), &[]).await;
-    
-        match res {
-            Ok(_) => HttpResponse::Created().json(serde_json::json!({"id": id.to_string()})),
+        match (&*data.db).execute(
+            "INSERT INTO records (id, zone_id, name, type, value, ttl) VALUES ($1, $2, $3, $4, $5, $6)",
+            &[&id_str, &zone_id_str, &body.name, &body.record_type, &body.value, &ttl]
+        ).await {
+            Ok(_) => {
+                info!("Created record: {} in zone: {}", body.name, zone_id_str);
+                HttpResponse::Created().json(serde_json::json!({"id": id.to_string()}))
+            }
             Err(e) => {
                 warn!("create_record error: {}", e);
-                HttpResponse::InternalServerError().finish()
+                HttpResponse::InternalServerError().json(serde_json::json!({"error": "failed to create record"}))
             }
         }
     }
@@ -669,13 +913,14 @@ async fn push_config_to_agents(
             .await
             .unwrap_or_default();
     
+        let ttl_val: i32 = row.get(5);
         let records: Vec<RecordResponse> = rows.into_iter().map(|r| RecordResponse {
-            id: r.get::<usize, String>(0),
-            zone_id: r.get::<usize, String>(1),
-            name: r.get::<usize, String>(2),
-            record_type: r.get::<usize, String>(3),
-            value: r.get::<usize, String>(4),
-            ttl: r.get::<usize, i32>(5) as u32,
+            id: r.get(0),
+            zone_id: r.get(1),
+            name: r.get(2),
+            record_type: r.get(3),
+            value: r.get(4),
+            ttl: r.get::<_, i32>(5) as u32,
         }).collect();
     
         HttpResponse::Ok().json(records)
@@ -763,28 +1008,175 @@ async fn push_config_to_agents(
         data: web::Data<AppState>,
         req: HttpRequest,
     ) -> impl Responder {
-        if auth_from_header(&req, &data.jwt_secret).is_none() {
-            return HttpResponse::Unauthorized().finish();
+        let auth = auth_from_header(&req, &data.jwt_secret);
+        if auth.is_none() {
+            return HttpResponse::Unauthorized().json(ErrorResponse { error: "unauthorized".to_string(), details: None });
         }
     
         let (zone_id, record_id) = path.into_inner();
     
-        let res = (&*data.db).execute(
+        // Check zone ownership
+        let owner_check = (&*data.db).query_opt(
+            "SELECT owner FROM zones WHERE id::text = $1",
+            &[&zone_id]
+        ).await;
+        
+        let tok = auth.unwrap();
+        let zone_owner: Option<String> = match owner_check {
+            Ok(Some(row)) => row.get(0),
+            _ => None
+        };
+        
+        if tok.claims.role != "admin" && zone_owner.as_ref() != Some(&tok.claims.sub) {
+            return HttpResponse::Forbidden().json(ErrorResponse { error: "access denied".to_string(), details: None });
+        }
+    
+        match (&*data.db).execute(
             "DELETE FROM records WHERE id::text = $1 AND zone_id::text = $2",
             &[&record_id, &zone_id]
-        ).await;
-    
-        match res {
+        ).await {
             Ok(count) => {
                 if count == 0 {
-                    HttpResponse::NotFound().finish()
+                    HttpResponse::NotFound().json(ErrorResponse { error: "record not found".to_string(), details: None })
                 } else {
-                    HttpResponse::Ok().finish()
+                    info!("Deleted record: {} from zone: {}", record_id, zone_id);
+                    HttpResponse::Ok().json(APIResponse { success: true, data: Some(()), error: None })
                 }
             }
             Err(e) => {
                 warn!("delete_record error: {}", e);
-                HttpResponse::InternalServerError().finish()
+                HttpResponse::InternalServerError().json(ErrorResponse { error: "failed to delete record".to_string(), details: None })
+            }
+        }
+    }
+
+    // Audit logs endpoint
+    #[derive(ToSchema, Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct AuditLogEntry {
+        id: String,
+        user_id: Option<String>,
+        action: String,
+        resource_type: String,
+        resource_id: Option<String>,
+        details: String,
+        ip_address: Option<String>,
+        created_at: String,
+    }
+
+    async fn list_audit_logs(
+        data: web::Data<AppState>,
+        req: HttpRequest,
+    ) -> impl Responder {
+        let auth = auth_from_header(&req, &data.jwt_secret);
+        if auth.is_none() {
+            return HttpResponse::Unauthorized().json(ErrorResponse { error: "unauthorized".to_string(), details: None });
+        }
+        let tok = auth.unwrap();
+        
+        // Only admins can view audit logs
+        if tok.claims.role != "admin" {
+            return HttpResponse::Forbidden().json(ErrorResponse { error: "admin access required".to_string(), details: None });
+        }
+        
+        let rows = (&*data.db).query(
+            "SELECT id::text, COALESCE(user_id::text, '') as user_id, action, resource_type, 
+                    COALESCE(resource_id, '') as resource_id, 
+                    COALESCE(details::text, '') as details,
+                    COALESCE(ip_address, '') as ip_address,
+                    created_at::text 
+             FROM audit_logs 
+             ORDER BY created_at DESC 
+             LIMIT 100",
+            &[]
+        ).await.unwrap_or_default();
+        
+        let logs: Vec<AuditLogEntry> = rows.into_iter().map(|r| AuditLogEntry {
+            id: r.get(0),
+            user_id: Some(r.get(1)).filter(|s: &String| !s.is_empty()),
+            action: r.get(2),
+            resource_type: r.get(3),
+            resource_id: Some(r.get(4)).filter(|s: &String| !s.is_empty()),
+            details: r.get(5),
+            ip_address: Some(r.get(6)).filter(|s: &String| !s.is_empty()),
+            created_at: r.get(7),
+        }).collect();
+        
+        HttpResponse::Ok().json(APIResponse { success: true, data: Some(logs), error: None })
+    }
+
+    // Get zone by ID
+    async fn get_zone(
+        path: web::Path<String>,
+        data: web::Data<AppState>,
+        req: HttpRequest,
+    ) -> impl Responder {
+        let auth = auth_from_header(&req, &data.jwt_secret);
+        if auth.is_none() {
+            return HttpResponse::Unauthorized().json(ErrorResponse { error: "unauthorized".to_string(), details: None });
+        }
+        
+        let zone_id = path.into_inner();
+        
+        match (&*data.db).query_one(
+            "SELECT id::text, domain, COALESCE(owner::text, '') as owner, zone_type, created_at::text FROM zones WHERE id::text = $1",
+            &[&zone_id]
+        ).await {
+            Ok(row) => {
+                let zone = ZoneWithOwner {
+                    id: row.get(0),
+                    domain: row.get(1),
+                    owner: row.get(2),
+                    zone_type: row.get(3),
+                    created_at: row.get(4),
+                };
+                HttpResponse::Ok().json(APIResponse { success: true, data: Some(zone), error: None })
+            }
+            Err(_) => HttpResponse::NotFound().json(ErrorResponse { error: "zone not found".to_string(), details: None })
+        }
+    }
+
+    // Delete zone
+    async fn delete_zone(
+        path: web::Path<String>,
+        data: web::Data<AppState>,
+        req: HttpRequest,
+    ) -> impl Responder {
+        let auth = auth_from_header(&req, &data.jwt_secret);
+        if auth.is_none() {
+            return HttpResponse::Unauthorized().json(ErrorResponse { error: "unauthorized".to_string(), details: None });
+        }
+        let tok = auth.unwrap();
+        
+        let zone_id = path.into_inner();
+        
+        // Check ownership
+        let owner_check = (&*data.db).query_opt(
+            "SELECT owner FROM zones WHERE id::text = $1",
+            &[&zone_id]
+        ).await;
+        
+        let zone_owner: Option<String> = match owner_check {
+            Ok(Some(row)) => row.get(0),
+            _ => None
+        };
+        
+        if tok.claims.role != "admin" && zone_owner.as_ref() != Some(&tok.claims.sub) {
+            return HttpResponse::Forbidden().json(ErrorResponse { error: "access denied".to_string(), details: None });
+        }
+        
+        match (&*data.db).execute("DELETE FROM zones WHERE id::text = $1", &[&zone_id]).await {
+            Ok(count) => {
+                if count == 0 {
+                    HttpResponse::NotFound().json(ErrorResponse { error: "zone not found".to_string(), details: None })
+                } else {
+                    info!("Deleted zone: {}", zone_id);
+                    HttpResponse::Ok().json(APIResponse { success: true, data: Some(()), error: None })
+                }
+            }
+            Err(e) => {
+                warn!("delete_zone error: {}", e);
+                HttpResponse::InternalServerError().json(ErrorResponse { error: "failed to delete zone".to_string(), details: None })
             }
         }
     }
@@ -859,30 +1251,55 @@ async fn main() -> std::io::Result<()> {
     let full_data = web::Data::new(full_state.clone());
 
         HttpServer::new(move || {
+            let cors = Cors::default()
+                .allowed_origin("http://localhost:3000")
+                .allowed_origin("http://localhost:5173")
+                .allowed_methods(vec!["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+                .allowed_headers(vec!["Authorization", "Content-Type"])
+                .max_age(3600);
+            
             App::new()
-                .wrap(Cors::default().allow_any_origin().allow_any_method().allow_any_header())
+                .wrap(cors)
                 .wrap(prometheus.clone())
                 .app_data(app_data.clone())
                 .app_data(full_data.clone())
+            .route("/health", web::get().to(health))
+            .route("/ready", web::get().to(ready))
+            // Auth
             .route("/api/v1/auth/login", web::post().to(login))
+            // Users
             .route("/api/v1/users", web::post().to(create_user))
+            // Servers
             .route("/api/v1/servers", web::get().to(list_servers))
             .route("/api/v1/servers", web::post().to(create_server))
-                    .route("/api/v1/zones", web::get().to(list_zones))
-                    .route("/api/v1/zones", web::post().to(create_zone))
+            // Zones
+            .route("/api/v1/zones", web::get().to(list_zones))
+            .route("/api/v1/zones", web::post().to(create_zone))
+            .route("/api/v1/zones/{id}", web::get().to(get_zone))
+            .route("/api/v1/zones/{id}", web::delete().to(delete_zone))
+            // Records
+            .route("/api/v1/zones/{id}/records", web::post().to(create_record))
+            .route("/api/v1/zones/{id}/records", web::get().to(list_records))
+            .route("/api/v1/zones/{zone_id}/records/{record_id}", web::put().to(update_record))
+            .route("/api/v1/zones/{zone_id}/records/{record_id}", web::delete().to(delete_record))
+            // Agents
             .route("/api/v1/agents/register", web::post().to(agent_register))
-                            .route("/api/v1/agents/heartbeat", web::post().to(agent_heartbeat))
-                            .route("/api/v1/agents", web::get().to(list_agents))
+            .route("/api/v1/agents/heartbeat", web::post().to(agent_heartbeat))
+            .route("/api/v1/agents", web::get().to(list_agents))
+            .route("/api/v1/agents/{id}/config", web::get().to(agent_get_config))
+            .route("/api/v1/agents/{id}/token/rotate", web::post().to(rotate_agent_token))
+            // DNS Control
             .route("/api/v1/dns/start", web::post().to(start_dns_server))
             .route("/api/v1/dns/stop", web::post().to(stop_dns_server))
+            // GeoRules
             .route("/api/v1/georules", web::post().to(create_georule))
             .route("/api/v1/georules", web::get().to(list_georules))
             .route("/api/v1/georules/resolve", web::post().to(resolve_by_geo))
+            // Config Push
             .route("/api/v1/config/push", web::post().to(push_config_to_agents))
-            .route("/health", web::get().to(health))
-            .route("/api/v1/agents/{id}/config", web::get().to(agent_get_config))
-            .route("/api/v1/agents/{id}/token/rotate", web::post().to(rotate_agent_token))
-            // explicit metrics handler (in addition to middleware-exposed endpoint)
+            // Audit Logs
+            .route("/api/v1/audit/logs", web::get().to(list_audit_logs))
+            // Metrics
             .route("/metrics", web::get().to(|| async move {
                 let encoder = TextEncoder::new();
                 let metric_families = gather();
@@ -890,10 +1307,6 @@ async fn main() -> std::io::Result<()> {
                 encoder.encode(&metric_families, &mut buffer).unwrap_or(());
                 HttpResponse::Ok().content_type("text/plain; version=0.0.4").body(buffer)
             }))
-                .route("/api/v1/zones/{id}/records", web::post().to(create_record))
-                .route("/api/v1/zones/{id}/records", web::get().to(list_records))
-                .route("/api/v1/zones/{zone_id}/records/{record_id}", web::put().to(update_record))
-                .route("/api/v1/zones/{zone_id}/records/{record_id}", web::delete().to(delete_record))
     })
     .bind(("0.0.0.0", 8080))?
     .run()

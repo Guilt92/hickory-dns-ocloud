@@ -1,0 +1,16 @@
+apiVersion: v2
+name: hickory-dns
+description: A production-ready DNS management platform built on Hickory DNS
+type: application
+version: 0.1.0
+appVersion: "0.26.0"
+keywords:
+  - dns
+  - hickory-dns
+  - dns-management
+  - geodns
+maintainers:
+  - name: Hickory DNS Team
+    email: team@hickory-dns.org
+sources:
+  - https://github.com/hickory-dns/hickory-dns

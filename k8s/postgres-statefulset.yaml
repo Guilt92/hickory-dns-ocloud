@@ -2,24 +2,38 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: postgres
+  namespace: hickory-dns
   labels:
     app: postgres
+    version: "15"
 spec:
   serviceName: "postgres"
   replicas: 1
   selector:
     matchLabels:
       app: postgres
+  updateStrategy:
+    type: RollingUpdate
+  podManagementPolicy: Parallel
   template:
     metadata:
       labels:
         app: postgres
+        version: "15"
     spec:
+      serviceAccountName: hickory-dns
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
       containers:
         - name: postgres
-          image: postgres:15
+          image: postgres:15-alpine
           ports:
-            - containerPort: 5432
+            - name: postgres
+              containerPort: 5432
+              protocol: TCP
           env:
             - name: POSTGRES_PASSWORD
               valueFrom:
@@ -28,30 +42,91 @@ spec:
                   key: postgres-password
             - name: POSTGRES_DB
               value: hickory
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+            - name: POSTGRES_INITDB_ARGS
+              value: "--encoding=UTF8 --locale=C"
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           volumeMounts:
             - name: pgdata
               mountPath: /var/lib/postgresql/data
-          readinessProbe:
-            tcpSocket:
-              port: 5432
-            initialDelaySeconds: 5
+            - name: tmp
+              mountPath: /tmp
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+            initialDelaySeconds: 30
             periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - postgres
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+      volumes:
+        - name: tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: pgdata
+        namespace: hickory-dns
       spec:
-        accessModes: [ "ReadWriteOnce" ]
+        accessModes: ["ReadWriteOnce"]
         resources:
           requests:
-            storage: 5Gi
+            storage: 10Gi
+        storageClassName: standard
 ---
 apiVersion: v1
 kind: Service
 metadata:
   name: postgres
+  namespace: hickory-dns
+  labels:
+    app: postgres
 spec:
   ports:
-    - port: 5432
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
   selector:
     app: postgres
   clusterIP: None
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-read
+  namespace: hickory-dns
+  labels:
+    app: postgres
+spec:
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP
+  selector:
+    app: postgres

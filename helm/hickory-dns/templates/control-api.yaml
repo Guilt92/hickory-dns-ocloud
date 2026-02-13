@@ -1,0 +1,112 @@
+{{- if .Values.controlApi.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "hickory-dns.fullname" . }}-control-api
+  namespace: {{ .Values.namespace }}
+  labels:
+    app: control-api
+    {{- include "hickory-dns.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.controlApi.replicaCount }}
+  selector:
+    matchLabels:
+      app: control-api
+  template:
+    metadata:
+      labels:
+        app: control-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+    spec:
+      serviceAccountName: {{ include "hickory-dns.fullname" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10000
+        fsGroup: 10000
+      containers:
+        - name: control-api
+          image: "{{ .Values.controlApi.image.registry }}/{{ .Values.controlApi.image.repository }}:{{ .Values.controlApi.image.tag }}"
+          imagePullPolicy: {{ .Values.controlApi.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: hickory-secrets
+                  key: database-url
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hickory-secrets
+                  key: jwt-secret
+            - name: RUST_LOG
+              value: {{ .Values.controlApi.config.rustLog | quote }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "hickory-dns.fullname" . }}-config
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: {{ .Values.controlApi.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.controlApi.livenessProbe.periodSeconds }}
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: {{ .Values.controlApi.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.controlApi.readinessProbe.periodSeconds }}
+          resources:
+            {{- toYaml .Values.controlApi.resources | nindent 10 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "hickory-dns.fullname" . }}-control-api
+  namespace: {{ .Values.namespace }}
+spec:
+  selector:
+    app: control-api
+  ports:
+    - port: {{ .Values.controlApi.service.port }}
+      targetPort: {{ .Values.controlApi.service.targetPort }}
+      name: http
+---
+{{- if .Values.controlApi.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "hickory-dns.fullname" . }}-control-api
+  namespace: {{ .Values.namespace }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "hickory-dns.fullname" . }}-control-api
+  minReplicas: {{ .Values.controlApi.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.controlApi.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.controlApi.autoscaling.targetCPUUtilizationPercentage }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.controlApi.autoscaling.targetMemoryUtilizationPercentage }}
+{{- end }}
+{{- end }}

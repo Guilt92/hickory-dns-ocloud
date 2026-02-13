@@ -7,28 +7,47 @@ edition = "2021"
 actix-web = { version = "4", default-features = false }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
 env_logger = "0.10"
 log = "0.4"
 prometheus = "0.14"
 actix-web-prom = "0.6"
 once_cell = { workspace = true }
-uuid = { version = "0.8", features = ["v4"] }
-tokio-postgres = { version = "0.7" }
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio-postgres = "0.7"
 serde_qs = "0.7"
-jsonwebtoken = "8"
-argon2 = "0.4"
+jsonwebtoken = "9"
+argon2 = "0.5"
 tracing = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 rand = { workspace = true }
 rand_core = { version = "0.6", features = ["getrandom"] }
 anyhow = "1"
-actix-cors = "0.6"
+actix-cors = "0.7"
+
+# OpenAPI / Swagger
+utoipa = "2"
+utoipa-actix-web = "0.1"
+
+# Rate limiting
+governor = "0.6"
+nonzero_ext = "0.3"
+
+# Async traits
+async-trait = "0.1"
+
+# Time
+time = "0.3"
 
 # Local workspace crates (integrate DNS core)
 hickory-server = { path = "../server", default-features = false }
 hickory-resolver = { path = "../resolver", optional = true }
 geodns = { path = "../geodns" }
 
+[dev-dependencies]
+tokio-test = "0.4"
+
 [profile.release]
 opt-level = 3
+lto = true
+codegen-units = 1

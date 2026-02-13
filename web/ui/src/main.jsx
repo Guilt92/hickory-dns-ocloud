@@ -1,21 +1,23 @@
-import React from 'react'
-import { createRoot } from 'react-dom/client'
-import { BrowserRouter } from 'react-router-dom'
-import api from './api'
-import './index.css'
-import App from './App'
-import { AuthProvider } from './contexts/AuthContext'
-import { NotificationsProvider } from './components/Notifications'
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import { BrowserRouter } from 'react-router-dom';
+import App from './App';
+import { setAuthToken } from './api/client';
+import './index.css';
 
-const token = localStorage.getItem('token')
-if (token) api.setToken(token)
+// Initialize auth token from localStorage
+const token = localStorage.getItem('token');
+if (token) {
+  setAuthToken(token);
+}
 
-createRoot(document.getElementById('root')).render(
-  <BrowserRouter>
-    <AuthProvider>
-      <NotificationsProvider>
-        <App />
-      </NotificationsProvider>
-    </AuthProvider>
-  </BrowserRouter>
-)
+const container = document.getElementById('root');
+const root = createRoot(container);
+
+root.render(
+  <React.StrictMode>
+    <BrowserRouter>
+      <App />
+    </BrowserRouter>
+  </React.StrictMode>
+);

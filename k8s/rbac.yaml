@@ -1,0 +1,41 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hickory-dns
+  labels:
+    name: hickory-dns
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: hickory-dns
+  namespace: hickory-dns
+  labels:
+    app: hickory-dns
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: hickory-dns
+  namespace: hickory-dns
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: hickory-dns
+  namespace: hickory-dns
+subjects:
+  - kind: ServiceAccount
+    name: hickory-dns
+    namespace: hickory-dns
+roleRef:
+  kind: Role
+  name: hickory-dns
+  apiGroup: rbac.authorization.k8s.io
